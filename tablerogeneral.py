@@ -253,7 +253,7 @@ def render_priority_panel(df_urgente):
 # APP PRINCIPAL
 # ============================================================
 def main():
-    st.title("📦 Minerva Inventory Insight")
+    st.title("📦 Minerva Consulta Comercial")
     st.caption("Panel interactivo de stock con recomendaciones automáticas de producción/reposición")
     st.markdown("---")
 

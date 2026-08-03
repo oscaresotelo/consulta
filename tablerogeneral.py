@@ -26,7 +26,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ============================================================
-# DATOS
+# CARGA Y PROCESAMIENTO DE DATOS ROBUSTO
 # ============================================================
 def get_db_connection():
     return sqlite3.connect("minerva.db", check_same_thread=False)
@@ -34,47 +34,148 @@ def get_db_connection():
 @st.cache_data(ttl=300)
 def load_data():
     conn = get_db_connection()
-    query = """
-    SELECT r.nombre AS Producto, e.descripcion AS Envase, SUM(s.cantidad) AS Cantidad
+    cursor = conn.cursor()
+
+    # 1. Cargar Stock Físico Base
+    query_stock = """
+    SELECT 
+        p.id AS producto_id,
+        p.id_receta,
+        p.envase_id,
+        r.nombre AS Producto, 
+        e.descripcion AS Envase, 
+        SUM(s.cantidad) AS Cantidad
     FROM stock_productos_envasados s
     JOIN recetas r ON s.receta_id = r.id
     JOIN envases e ON s.envase_id = e.id
     JOIN productos p ON p.id_receta = r.id AND p.envase_id = e.id
     WHERE s.cliente_id = 6 AND p.activo = 1
-    GROUP BY r.nombre, e.descripcion
+    GROUP BY p.id, r.nombre, e.descripcion
     """
-    df = pd.read_sql_query(query, conn)
+    try:
+        df_stock = pd.read_sql_query(query_stock, conn)
+    except Exception:
+        query_stock_alt = """
+        SELECT 
+            p.id_receta,
+            p.envase_id,
+            r.nombre AS Producto, 
+            e.descripcion AS Envase, 
+            SUM(s.cantidad) AS Cantidad
+        FROM stock_productos_envasados s
+        JOIN recetas r ON s.receta_id = r.id
+        JOIN envases e ON s.envase_id = e.id
+        JOIN productos p ON p.id_receta = r.id AND p.envase_id = e.id
+        WHERE s.cliente_id = 6 AND p.activo = 1
+        GROUP BY r.nombre, e.descripcion
+        """
+        df_stock = pd.read_sql_query(query_stock_alt, conn)
+
+    df_stock["Venta_Mensual"] = 0.0
+
+    # Fecha desde la cual se analiza el historial de ventas para el promedio
+    FECHA_INICIO_ANALISIS = "2026-03-01"
+
+    # 2. Cargar ventas uniendo detalle_venta -> stock_productos_envasados
+    #    (detalle_venta NO tiene FK directa a producto/receta; solo tiene
+    #    stock_id, que apunta a stock_productos_envasados. De ahí se obtienen
+    #    receta_id y envase_id, los mismos campos usados para armar el stock)
+    query_ventas = """
+    SELECT
+        s.receta_id AS receta_id,
+        s.envase_id AS envase_id,
+        dv.cantidad AS cantidad,
+        v.fecha_venta AS fecha
+    FROM detalle_venta dv
+    JOIN stock_productos_envasados s ON dv.stock_id = s.id
+    JOIN ventas v ON dv.venta_id = v.id
+    WHERE s.cliente_id = 6 AND v.estado_venta = 'activa'
+      AND v.fecha_venta >= ?
+    """
+    try:
+        df_ventas = pd.read_sql_query(query_ventas, conn, params=(FECHA_INICIO_ANALISIS,))
+
+        if not df_ventas.empty:
+            # Convertir fechas de forma flexible y asegurar tipos numéricos
+            df_ventas["fecha_dt"] = pd.to_datetime(df_ventas["fecha"], errors="coerce")
+            df_ventas["receta_id"] = pd.to_numeric(df_ventas["receta_id"], errors="coerce")
+            df_ventas["envase_id"] = pd.to_numeric(df_ventas["envase_id"], errors="coerce")
+            df_ventas["cantidad"] = pd.to_numeric(df_ventas["cantidad"], errors="coerce").fillna(0)
+            df_ventas = df_ventas.dropna(subset=["fecha_dt", "receta_id", "envase_id"])
+
+            if not df_ventas.empty:
+                # ANALIZAR EL HISTORIAL COMPLETO
+                df_ventas["periodo"] = df_ventas["fecha_dt"].dt.to_period("M")
+
+                min_fecha = df_ventas["fecha_dt"].min()
+                max_fecha = df_ventas["fecha_dt"].max()
+
+                # Cantidad total de meses distintos con registros de venta
+                cant_meses = max(1, df_ventas["periodo"].nunique())
+
+                # Calcular venta mensual promedio histórica por (receta_id, envase_id)
+                ventas_por_prod = (
+                    df_ventas.groupby(["receta_id", "envase_id"])["cantidad"].sum() / cant_meses
+                )
+                dict_ventas = ventas_por_prod.to_dict()
+
+                # Asignar promedio a la tabla de stock por la misma clave (receta, envase)
+                df_stock["Venta_Mensual"] = df_stock.apply(
+                    lambda row: dict_ventas.get((row["id_receta"], row["envase_id"]), 0.0),
+                    axis=1,
+                )
+
+                # Guardar resumen del historial
+                st.session_state["historial_info"] = {
+                    "total_ventas": len(df_ventas),
+                    "cant_meses": cant_meses,
+                    "fecha_inicio": min_fecha.strftime("%d/%m/%Y"),
+                    "fecha_fin": max_fecha.strftime("%d/%m/%Y")
+                }
+    except Exception as e:
+        st.error(f"⚠️ Ocurrió una advertencia al procesar ventas: {e}")
+
     conn.close()
-    return df
+    df_stock["Venta_Mensual"] = df_stock["Venta_Mensual"].round(1)
+    return df_stock
 
 # ============================================================
-# LÓGICA DE DECISIÓN
+# LÓGICA DE DECISIÓN BASADA EN VENTAS
 # ============================================================
-def clasificar_stock(df, critico, bajo, excedente):
-    def estado(cant):
-        if cant < critico:
-            return "Crítico"
-        elif cant < bajo:
-            return "Bajo"
-        elif cant <= excedente:
-            return "Normal"
-        else:
-            return "Excedente"
+def clasificar_stock(df, meses_critico, meses_objetivo, meses_excedente, stock_min_defecto):
+    def evaluar_producto(row):
+        cant = row["Cantidad"]
+        venta_m = row["Venta_Mensual"]
 
-    def accion(cant):
-        if cant < critico:
-            return f"Producir urgente (faltan {int(bajo - cant)} u. para salir de zona baja)"
-        elif cant < bajo:
-            return f"Reponer pronto (sugerido +{int(excedente - cant)} u.)"
-        elif cant <= excedente:
-            return "Stock saludable, sin acción"
+        if venta_m > 0:
+            s_critico = int(round(venta_m * meses_critico))
+            s_necesario = int(round(venta_m * meses_objetivo))
+            s_excedente = int(round(venta_m * meses_excedente))
         else:
-            return "Evaluar sobreproducción / redistribuir"
+            s_critico = int(round(stock_min_defecto * 0.5))
+            s_necesario = int(stock_min_defecto)
+            s_excedente = int(stock_min_defecto * 3)
 
-    df = df.copy()
-    df["Estado"] = df["Cantidad"].apply(estado)
-    df["Accion_Recomendada"] = df["Cantidad"].apply(accion)
-    return df
+        faltante = max(0, s_necesario - cant)
+
+        if cant <= s_critico:
+            estado = "Crítico"
+            accion = f"Producir urgente (faltan {faltante} u. para stock necesario de {s_necesario} u.)"
+        elif cant < s_necesario:
+            estado = "Bajo"
+            accion = f"Reponer pronto (faltan {faltante} u. para stock necesario de {s_necesario} u.)"
+        elif cant <= s_excedente:
+            estado = "Normal"
+            accion = "Stock saludable, sin acción"
+        else:
+            estado = "Excedente"
+            accion = f"Evaluar sobreproducción (exceso de {cant - s_excedente} u.)"
+
+        return pd.Series([s_necesario, faltante, estado, accion])
+
+    df_calc = df.copy()
+    df_calc[["Stock_Necesario", "Cantidad_A_Producir", "Estado", "Accion_Recomendada"]] = df_calc.apply(evaluar_producto, axis=1)
+    return df_calc
 
 ESTADO_COLOR = {
     "Crítico": "#EF4444",
@@ -138,7 +239,7 @@ def render_kpi_cards(total_skus, stock_total, criticos, bajos, excedentes):
     components.html(html, height=110)
 
 # ============================================================
-# COMPONENTE HTML/JS: TABLA INTERACTIVA (orden + búsqueda instantánea)
+# COMPONENTE HTML/JS: TABLA INTERACTIVA
 # ============================================================
 def render_interactive_table(df):
     records = df.to_dict(orient="records")
@@ -162,10 +263,10 @@ def render_interactive_table(df):
     <script>
       const data = {data_json};
       const colors = {color_json};
-      const cols = ["Producto","Envase","Cantidad","Estado","Accion_Recomendada"];
-      const labels = ["Producto","Envase","Cantidad","Estado","Acción recomendada"];
-      let sortCol = "Cantidad";
-      let sortAsc = true;
+      const cols = ["Producto","Envase","Cantidad","Venta_Mensual","Stock_Necesario","Cantidad_A_Producir","Estado","Accion_Recomendada"];
+      const labels = ["Producto","Envase","Stock Actual","Venta Prom./Mes","Stock Necesario","A Fabricar","Estado","Acción recomendada"];
+      let sortCol = "Cantidad_A_Producir";
+      let sortAsc = false;
 
       function buildHeader() {{
         const row = document.getElementById("headerRow");
@@ -209,6 +310,10 @@ def render_interactive_table(df):
             if (c === "Estado") {{
               td.innerHTML = `<span style="background:${{colors[r[c]]}}22; color:${{colors[r[c]]}};
                 padding:3px 10px; border-radius:999px; font-weight:600; font-size:12px;">${{r[c]}}</span>`;
+            }} else if (c === "Cantidad_A_Producir") {{
+              td.innerHTML = r[c] > 0 
+                ? `<strong style="color:#DC2626;">+${{r[c]}} u.</strong>` 
+                : `<span style="color:#059669;">0 u.</span>`;
             }} else {{
               td.textContent = r[c];
             }}
@@ -234,11 +339,11 @@ def render_priority_panel(df_urgente):
     for _, row in df_urgente.iterrows():
         color = ESTADO_COLOR[row["Estado"]]
         cards += f"""
-        <div style="min-width:230px; background:white; border-left:6px solid {color};
-             border-radius:12px; padding:14px 16px; box-shadow:0 3px 8px rgba(0,0,0,.06);">
+        <div style="min-width:240px; background:white; border-left:6px solid {color};
+               border-radius:12px; padding:14px 16px; box-shadow:0 3px 8px rgba(0,0,0,.06);">
           <div style="font-size:12px; font-weight:700; color:{color}; text-transform:uppercase;">{row['Estado']}</div>
           <div style="font-size:15px; font-weight:600; margin:4px 0;">{row['Producto']}</div>
-          <div style="font-size:12px; color:#64748B;">{row['Envase']} · {row['Cantidad']} u.</div>
+          <div style="font-size:12px; color:#64748B;">{row['Envase']} · Actual: <b>{row['Cantidad']} u.</b> (Venta: <b>{row['Venta_Mensual']} u/mes</b>)</div>
           <div style="font-size:12px; margin-top:6px; color:#334155;">{row['Accion_Recomendada']}</div>
         </div>
         """
@@ -254,7 +359,7 @@ def render_priority_panel(df_urgente):
 # ============================================================
 def main():
     st.title("📦 Minerva Consulta Comercial")
-    st.caption("Panel interactivo de stock con recomendaciones automáticas de producción/reposición")
+    st.caption("Panel interactivo con cálculo dinámico de stock necesario según historial de ventas por producto")
     st.markdown("---")
 
     df_raw = load_data()
@@ -262,22 +367,38 @@ def main():
         st.warning("No se encontraron registros activos.")
         return
 
-    # --- Sidebar: umbrales configurables por el usuario ---
-    st.sidebar.header("⚙️ Umbrales de decisión")
-    critico = st.sidebar.slider("Límite Crítico (<)", 0, 50, 5)
-    bajo = st.sidebar.slider("Límite Bajo (<)", critico + 1, 100, 15)
-    excedente = st.sidebar.slider("Límite Excedente (>)", bajo + 1, 500, 80)
-    st.sidebar.caption("Ajustá los umbrales y las recomendaciones se recalculan al instante.")
+    # Aviso en el sidebar sobre el historial
+    total_ventas_calc = df_raw["Venta_Mensual"].sum()
+    info_h = st.session_state.get("historial_info", None)
+    if total_ventas_calc > 0 and info_h:
+        st.sidebar.success(
+            f"✅ **Historial 100% Analizado**\n\n"
+            f"- **Ventas analizadas:** {info_h['total_ventas']} registros\n"
+            f"- **Rango:** {info_h['fecha_inicio']} a {info_h['fecha_fin']}\n"
+            f"- **Meses históricos:** {info_h['cant_meses']} mes(es)\n"
+            f"- **Productos con venta:** {len(df_raw[df_raw['Venta_Mensual'] > 0])} SKUs"
+        )
+    else:
+        st.sidebar.info("ℹ️ Mostrando stock base por defecto. No se detectó coincidencia directa con la tabla de ventas.")
 
-    df = clasificar_stock(df_raw, critico, bajo, excedente)
-    urgentes = df[df["Estado"].isin(["Crítico", "Bajo"])].sort_values("Cantidad")
+    # --- Sidebar: Parámetros ---
+    st.sidebar.header("🎯 Cobertura de Stock por Ventas")
+    meses_objetivo = st.sidebar.slider("Meses de cobertura deseados", 0.5, 6.0, 1.5, 0.5)
+    meses_critico = st.sidebar.slider("Alerta Crítica (< meses)", 0.1, max(0.2, meses_objetivo - 0.1), min(0.5, meses_objetivo - 0.1), 0.1)
+    meses_excedente = st.sidebar.slider("Alerta Excedente (> meses)", meses_objetivo + 0.5, 12.0, 3.0, 0.5)
 
-    # --- Tabla interactiva (arriba) ---
-    st.markdown("## 📋 Detalle de Inventario")
+    st.sidebar.markdown("---")
+    stock_min_defecto = st.sidebar.number_input("Stock mín. (Productos sin venta)", min_value=0, value=10, step=5)
+
+    # Lógica de cálculo
+    df = clasificar_stock(df_raw, meses_critico, meses_objetivo, meses_excedente, stock_min_defecto)
+    urgentes = df[df["Estado"].isin(["Crítico", "Bajo"])].sort_values("Cantidad_A_Producir", ascending=False)
+
+    # --- UI Principal ---
+    st.markdown(f"## 📋 Detalle de Inventario (Meta: {meses_objetivo} mes(es) de cobertura)")
     render_interactive_table(df)
     st.markdown("---")
 
-    # --- KPIs animados ---
     render_kpi_cards(
         total_skus=len(df),
         stock_total=int(df["Cantidad"].sum()),
@@ -286,54 +407,34 @@ def main():
         excedentes=len(df[df["Estado"] == "Excedente"]),
     )
 
-    # --- Panel de acción prioritaria ---
-    st.write("### 🚨 Acción prioritaria")
+    st.write("### 🚨 Acción prioritaria (Faltantes a fabricar hoy)")
     render_priority_panel(urgentes)
 
     st.write("## 📊 Análisis Visual")
     col_g1, col_g2 = st.columns([2, 1])
 
     with col_g1:
-        top20 = df.sort_values("Cantidad").head(20)
+        top20 = df.sort_values("Cantidad_A_Producir", ascending=False).head(20)
         fig_bar = px.bar(
-            top20, x="Cantidad", y="Producto", orientation="h",
+            top20, x="Cantidad_A_Producir", y="Producto", orientation="h",
             color="Estado", color_discrete_map=ESTADO_COLOR,
-            title="Productos con menor stock (ordenados por urgencia)",
+            title="Top 20 Productos a producir (u. faltantes)",
+            hover_data=["Venta_Mensual", "Cantidad", "Stock_Necesario"]
         )
-        fig_bar.update_layout(
-            plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
-            yaxis=dict(autorange="reversed"),
-        )
+        fig_bar.update_layout(plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)", yaxis=dict(autorange="reversed"))
         st.plotly_chart(fig_bar, use_container_width=True)
 
     with col_g2:
         estado_counts = df["Estado"].value_counts().reset_index()
         estado_counts.columns = ["Estado", "Cantidad_SKUs"]
-        fig_pie = px.pie(
-            estado_counts, values="Cantidad_SKUs", names="Estado",
-            color="Estado", color_discrete_map=ESTADO_COLOR,
-            hole=0.45, title="SKUs por estado de stock",
-        )
-        fig_pie.update_layout(margin=dict(t=40, b=0, l=0, r=0))
+        fig_pie = px.pie(estado_counts, values="Cantidad_SKUs", names="Estado", color="Estado", color_discrete_map=ESTADO_COLOR, hole=0.45, title="SKUs por estado")
         st.plotly_chart(fig_pie, use_container_width=True)
 
-    # Treemap: visión global de dónde está inmovilizado el stock
-    fig_tree = px.treemap(
-        df, path=["Envase", "Producto"], values="Cantidad",
-        color="Estado", color_discrete_map=ESTADO_COLOR,
-        title="Distribución de stock por envase y producto (tamaño = cantidad, color = estado)",
-    )
-    fig_tree.update_layout(margin=dict(t=40, b=0, l=0, r=0))
+    fig_tree = px.treemap(df, path=["Envase", "Producto"], values="Cantidad", color="Estado", color_discrete_map=ESTADO_COLOR, title="Distribución de stock")
     st.plotly_chart(fig_tree, use_container_width=True)
 
-    # --- Descarga de la lista de acción ---
     csv = urgentes.to_csv(index=False).encode("utf-8")
-    st.download_button(
-        "⬇️ Descargar lista de productos a reponer/producir",
-        data=csv,
-        file_name="productos_a_reponer.csv",
-        mime="text/csv",
-    )
+    st.download_button("⬇️ Descargar lista de producción (CSV)", data=csv, file_name="plan_de_produccion.csv", mime="text/csv")
 
 if __name__ == "__main__":
     main()

@@ -454,15 +454,18 @@ with tab_mp:
         costo_mp_por_litro_ars = 0.0
 
 with tab_pkg:
-    st.subheader("📦 Costeo de Packaging y Envases (Calculado en USD / ARS)")
+    st.subheader("📦 Costeo Detallado de Packing y Packaging por Envase (ARS / USD)")
     
     df_envases_todos = load_envases_todos()
     df_pkg_receta = load_packaging_receta(receta_id_sel)
     
     default_envases_ids = df_pkg_receta['packaging_id'].unique().tolist() if not df_pkg_receta.empty else []
     
-    st.markdown("#### 🎯 Selección de Envases e Insumos")
+    st.markdown("#### 🎯 Selección de Envases e Insumos Principales")
     
+    total_costo_pkg_base_ars = 0.0
+    total_costo_pkg_base_usd = 0.0
+
     if not df_envases_todos.empty:
         opciones_envases = df_envases_todos['packaging_id'].tolist()
         envases_seleccionados = st.multiselect(
@@ -475,6 +478,25 @@ with tab_pkg:
         if envases_seleccionados:
             df_pkg = df_envases_todos[df_envases_todos['packaging_id'].isin(envases_seleccionados)].copy()
             
+            # Asignar/Editar la capacidad de caja por envase (por ejemplo 6, 12, 60 unidades por caja)
+            st.markdown("##### 📦 Configuración de Capacidad por Caja según Envase")
+            st.caption("Especifique cuántas unidades de cada envase contiene una caja de embalaje (ej. 6, 12, 60 unidades).")
+            
+            unidades_por_caja_dict = {}
+            col_caps = st.columns(min(len(df_pkg), 4))
+            for i, (idx, row) in enumerate(df_pkg.iterrows()):
+                c_col = col_caps[i % 4]
+                u_caja = c_col.number_input(
+                    f"U. por caja [{row['insumo']}]:",
+                    min_value=1,
+                    value=12 if "ampolla" not in str(row['insumo']).lower() else 60,
+                    step=1,
+                    key=f"u_caja_{row['packaging_id']}"
+                )
+                unidades_por_caja_dict[row['packaging_id']] = u_caja
+                
+            df_pkg['unidades_por_caja'] = df_pkg['packaging_id'].map(unidades_por_caja_dict)
+
             costos_pkg_usd = []
             for idx, row in df_pkg.iterrows():
                 precio_u = float(row['costo_ultima_compra_usd']) if pd.notnull(row['costo_ultima_compra_usd']) else 0.0
@@ -491,41 +513,24 @@ with tab_pkg:
             df_pkg['subtotal_ars'] = df_pkg['subtotal_usd'] * tipo_cambio_usd
             df_pkg['costo_por_litro_ars'] = df_pkg['subtotal_ars'] / litros_totales_receta if litros_totales_receta > 0 else 0.0
 
-            st.markdown("**Detalle de envases seleccionados y su impacto en el costo:**")
-            st.dataframe(
-                df_pkg[['insumo', 'capacidad_litros', 'unidades_lote', 'costo_unitario_usd', 'costo_unitario_ars', 'subtotal_usd', 'subtotal_ars', 'costo_por_litro_ars']],
-                column_config={
-                    "insumo": "Envase / Insumo",
-                    "capacidad_litros": st.column_config.NumberColumn("Capacidad (L)", format="%.2f L"),
-                    "unidades_lote": st.column_config.NumberColumn("Unidades Lote", format="%.1f u"),
-                    "costo_unitario_usd": st.column_config.NumberColumn("Precio U. (USD)", format="$%.4f"),
-                    "costo_unitario_ars": st.column_config.NumberColumn("Precio U. (ARS)", format="$%.2f"),
-                    "subtotal_usd": st.column_config.NumberColumn("Subtotal Lote (USD)", format="$%.2f"),
-                    "subtotal_ars": st.column_config.NumberColumn("Subtotal Lote (ARS)", format="$%.2f"),
-                    "costo_por_litro_ars": st.column_config.NumberColumn("Costo / Litro (ARS)", format="$%.2f")
-                },
-                hide_index=True,
-                use_container_width=True
-            )
-            
             total_costo_pkg_base_ars = df_pkg['subtotal_ars'].sum()
             total_costo_pkg_base_usd = df_pkg['subtotal_usd'].sum()
-        else:
-            st.warning("No has seleccionado ningún envase. Puedes elegir uno del desplegable arriba.")
-            total_costo_pkg_base_ars = 0.0
-            total_costo_pkg_base_usd = 0.0
-    else:
-        st.info("No se encontraron envases registrados en la base de datos.")
-        total_costo_pkg_base_ars = 0.0
-        total_costo_pkg_base_usd = 0.0
 
     st.markdown("---")
-    st.markdown("#### 🎗️ Insumos y Materiales de Embalaje Adicionales")
-    st.caption("Agrega o edita insumos secundarios como cintas de embalar, cajas de cartón, etiquetas, film stretch o separadores para el lote.")
+    st.markdown("#### 🎗️ Costos de Embalaje, Cinta y Gastos de Packing Secundario")
+    st.caption("Configure los costos unitarios de Cajas de Cartón, Cinta Adhesiva de embalar y otros insumos directos.")
 
+    col_emb1, col_emb2, col_emb3 = st.columns(3)
+    costo_caja_unitario_ars = col_emb1.number_input("Costo Unitario de Caja de Cartón (ARS):", min_value=0.0, value=850.0, step=50.0)
+    costo_rollo_cinta_ars = col_emb2.number_input("Costo Rollo de Cinta de Embalar (ARS):", min_value=0.0, value=1500.0, step=100.0)
+    metros_por_rollo = col_emb2.number_input("Metros por Rollo de Cinta (m):", min_value=1.0, value=50.0, step=5.0)
+    metros_cinta_por_caja = col_emb3.number_input("Metros de cinta usados por caja (m):", min_value=0.1, value=1.5, step=0.1)
+
+    costo_metro_cinta = costo_rollo_cinta_ars / metros_por_rollo if metros_por_rollo > 0 else 0.0
+    costo_cinta_por_caja = costo_metro_cinta * metros_cinta_por_caja
+
+    st.markdown("##### 📋 Insumos Secundarios Adicionales (Etiquetas, Film Stretch, Separadores)")
     default_extra_pkg = pd.DataFrame([
-        {"Insumo": "Cinta de embalar (rollos)", "Costo Unitario (ARS)": 1500.0, "Cantidad por Lote": 0.5, "Tipo": "Por Lote"},
-        {"Insumo": "Cajas de cartón corrugado", "Costo Unitario (ARS)": 850.0, "Cantidad por Lote": 10.0, "Tipo": "Por Lote"},
         {"Insumo": "Etiquetas autoadhesivas", "Costo Unitario (ARS)": 120.0, "Cantidad por Lote": 50.0, "Tipo": "Por Lote"},
         {"Insumo": "Film Stretch (kg)", "Costo Unitario (ARS)": 3200.0, "Cantidad por Lote": 0.2, "Tipo": "Por Lote"},
     ])
@@ -535,7 +540,7 @@ with tab_pkg:
         num_rows="dynamic",
         use_container_width=True,
         column_config={
-            "Insumo": st.column_config.TextColumn("Descripción del Insumo", help="Ej: Cinta, Cajas, Etiquetas, etc."),
+            "Insumo": st.column_config.TextColumn("Descripción del Insumo", help="Ej: Etiquetas, Separadores, etc."),
             "Costo Unitario (ARS)": st.column_config.NumberColumn("Costo Unitario (ARS)", format="$%.2f", min_value=0.0),
             "Cantidad por Lote": st.column_config.NumberColumn("Cantidad", format="%.2f", min_value=0.0),
             "Tipo": st.column_config.SelectboxColumn("Criterio de Cálculo", options=["Por Lote", "Por Litro"], default="Por Lote")
@@ -556,14 +561,76 @@ with tab_pkg:
                 total_extra_pkg_ars += costo_u * cant
 
     costo_pkg_adicional_litro = st.number_input("Costo Adicional General Directo por Litro (ARS):", min_value=0.0, value=0.0, step=5.0)
-    
-    total_costo_pkg_ars = total_costo_pkg_base_ars + total_extra_pkg_ars + (costo_pkg_adicional_litro * litros_totales_receta)
-    total_costo_pkg_usd_final = total_costo_pkg_base_usd + (total_extra_pkg_ars / tipo_cambio_usd if tipo_cambio_usd > 0 else 0.0)
-    costo_pkg_por_litro_ars = total_costo_pkg_ars / litros_totales_receta if litros_totales_receta > 0 else 0.0
-    
+
+    # 📊 ANÁLISIS DETALLADO DEL COSTO DE PACKING POR ENVASE INDIVIDUAL
+    if not df_envases_todos.empty and envases_seleccionados:
+        st.markdown("---")
+        st.markdown("### 📊 Desglose del Costo de Packing Unitario por Envase")
+        st.caption("Detalle individualizado de cuánto cuesta empaquetar 1 solo envase (Envase + Caja Prorrateada + Cinta Prorrateada + Extras).")
+
+        df_detalle_packing_envase = []
+
+        for idx, row in df_pkg.iterrows():
+            u_caja = row['unidades_por_caja']
+            costo_envase_u = row['costo_unitario_ars']
+            
+            # Prorrateo de Caja y Cinta por unidad de envase
+            costo_caja_por_envase = costo_caja_unitario_ars / u_caja if u_caja > 0 else 0.0
+            costo_cinta_por_envase = costo_cinta_por_caja / u_caja if u_caja > 0 else 0.0
+            
+            # Prorrateo de Insumos Extras por unidad de envase
+            total_unidades_envase_lote = row['unidades_lote']
+            costo_extras_por_envase = (total_extra_pkg_ars + (costo_pkg_adicional_litro * litros_totales_receta)) / total_unidades_envase_lote if total_unidades_envase_lote > 0 else 0.0
+            
+            costo_packing_total_unitario = costo_envase_u + costo_caja_por_envase + costo_cinta_por_envase + costo_extras_por_envase
+
+            df_detalle_packing_envase.append({
+                "Envase / Insumo": row['insumo'],
+                "Capacidad (L)": row['capacidad_litros'],
+                "Unid. por Caja": u_caja,
+                "Costo Envase U. (ARS)": costo_envase_u,
+                "Costo Caja U. (ARS)": costo_caja_por_envase,
+                "Costo Cinta U. (ARS)": costo_cinta_por_envase,
+                "Costo Extras U. (ARS)": costo_extras_por_envase,
+                "COSTO TOTAL PACKING / ENVASE": costo_packing_total_unitario
+            })
+
+        df_packing_resumen = pd.DataFrame(df_detalle_packing_envase)
+
+        st.dataframe(
+            df_packing_resumen,
+            column_config={
+                "Envase / Insumo": "Envase",
+                "Capacidad (L)": st.column_config.NumberColumn("Capacidad (L)", format="%.2f L"),
+                "Unid. por Caja": st.column_config.NumberColumn("Unidades / Caja", format="%d u"),
+                "Costo Envase U. (ARS)": st.column_config.NumberColumn("Costo Envase U.", format="$%.2f"),
+                "Costo Caja U. (ARS)": st.column_config.NumberColumn("Costo Caja / Envase", format="$%.2f"),
+                "Costo Cinta U. (ARS)": st.column_config.NumberColumn("Costo Cinta / Envase", format="$%.2f"),
+                "Costo Extras U. (ARS)": st.column_config.NumberColumn("Costo Extras / Envase", format="$%.2f"),
+                "COSTO TOTAL PACKING / ENVASE": st.column_config.NumberColumn("COSTO PACKING / ENVASE", format="$%.2f")
+            },
+            hide_index=True,
+            use_container_width=True
+        )
+
+        # Cálculo de totales globales para la pestaña de resumen
+        cajas_totales_lote = sum([row['unidades_lote'] / row['unidades_por_caja'] for idx, row in df_pkg.iterrows() if row['unidades_por_caja'] > 0])
+        costo_cajas_lote_ars = cajas_totales_lote * costo_caja_unitario_ars
+        costo_cinta_lote_ars = cajas_totales_lote * costo_cinta_por_caja
+        
+        total_costo_pkg_ars = total_costo_pkg_base_ars + costo_cajas_lote_ars + costo_cinta_lote_ars + total_extra_pkg_ars + (costo_pkg_adicional_litro * litros_totales_receta)
+        total_costo_pkg_usd_final = total_costo_pkg_ars / tipo_cambio_usd if tipo_cambio_usd > 0 else 0.0
+        costo_pkg_por_litro_ars = total_costo_pkg_ars / litros_totales_receta if litros_totales_receta > 0 else 0.0
+
+    else:
+        total_costo_pkg_ars = total_extra_pkg_ars + (costo_pkg_adicional_litro * litros_totales_receta)
+        total_costo_pkg_usd_final = total_costo_pkg_ars / tipo_cambio_usd if tipo_cambio_usd > 0 else 0.0
+        costo_pkg_por_litro_ars = total_costo_pkg_ars / litros_totales_receta if litros_totales_receta > 0 else 0.0
+
+    st.divider()
     p1, p2, p3 = st.columns(3)
-    p1.metric("Total Packaging (USD)", f"USD ${total_costo_pkg_usd_final:,.2f}")
-    p2.metric("Total Packaging (ARS)", f"${total_costo_pkg_ars:,.2f} ARS", delta=f"Incluye Insumos: ${total_extra_pkg_ars:,.2f} ARS")
+    p1.metric("Total Packaging Lote (USD)", f"USD ${total_costo_pkg_usd_final:,.2f}")
+    p2.metric("Total Packaging Lote (ARS)", f"${total_costo_pkg_ars:,.2f} ARS")
     p3.metric("Costo Packaging por Litro", f"${costo_pkg_por_litro_ars:,.2f} ARS/L")
 
 with tab_mod:

@@ -39,12 +39,34 @@ def get_db_connection():
     return sqlite3.connect("minerva.db", check_same_thread=False)
 
 @st.cache_data(ttl=300)
-def load_data():
-    """Carga y procesa el stock físico y el historial de ventas por producto."""
+def load_clientes():
+    """Carga la lista de clientes disponibles en la base de datos."""
+    conn = get_db_connection()
+    try:
+        df_cli = pd.read_sql_query("SELECT id, nombre FROM clientes", conn)
+    except Exception:
+        try:
+            df_cli = pd.read_sql_query("SELECT DISTINCT cliente_id AS id, ('Cliente ' || cliente_id) AS nombre FROM stock_productos_envasados", conn)
+        except Exception:
+            df_cli = pd.DataFrame(columns=["id", "nombre"])
+    conn.close()
+    return df_cli
+
+@st.cache_data(ttl=300)
+def load_data(cliente_id=None):
+    """Carga y procesa el stock físico y el historial de ventas por producto, filtrando opcionalmente por cliente."""
     conn = get_db_connection()
 
     # 1. Cargar Stock Físico Base
-    query_stock = """
+    where_stock_clauses = ["p.activo = 1"]
+    params_stock = []
+    if cliente_id is not None:
+        where_stock_clauses.append("s.cliente_id = ?")
+        params_stock.append(cliente_id)
+    
+    where_stock_str = " WHERE " + " AND ".join(where_stock_clauses)
+
+    query_stock = f"""
     SELECT 
         p.id AS producto_id,
         p.id_receta,
@@ -56,13 +78,13 @@ def load_data():
     JOIN recetas r ON s.receta_id = r.id
     JOIN envases e ON s.envase_id = e.id
     JOIN productos p ON p.id_receta = r.id AND p.envase_id = e.id
-    WHERE s.cliente_id = 6 AND p.activo = 1
+    {where_stock_str}
     GROUP BY p.id, r.nombre, e.descripcion
     """
     try:
-        df_stock = pd.read_sql_query(query_stock, conn)
+        df_stock = pd.read_sql_query(query_stock, conn, params=params_stock)
     except Exception:
-        query_stock_alt = """
+        query_stock_alt = f"""
         SELECT 
             p.id_receta,
             p.envase_id,
@@ -73,15 +95,26 @@ def load_data():
         JOIN recetas r ON s.receta_id = r.id
         JOIN envases e ON s.envase_id = e.id
         JOIN productos p ON p.id_receta = r.id AND p.envase_id = e.id
-        WHERE s.cliente_id = 6 AND p.activo = 1
+        {where_stock_str}
         GROUP BY r.nombre, e.descripcion
         """
-        df_stock = pd.read_sql_query(query_stock_alt, conn)
+        df_stock = pd.read_sql_query(query_stock_alt, conn, params=params_stock)
 
     df_stock["Venta_Mensual"] = 0.0
     FECHA_INICIO_ANALISIS = "2026-03-01"
 
-    query_ventas = """
+    where_ventas_clauses = [
+        "LOWER(v.estado_venta) = 'activa'",
+        "v.fecha_venta >= ?"
+    ]
+    params_ventas = [FECHA_INICIO_ANALISIS]
+    if cliente_id is not None:
+        where_ventas_clauses.append("s.cliente_id = ?")
+        params_ventas.append(cliente_id)
+
+    where_ventas_str = " WHERE " + " AND ".join(where_ventas_clauses)
+
+    query_ventas = f"""
     SELECT
         s.receta_id AS receta_id,
         s.envase_id AS envase_id,
@@ -90,11 +123,10 @@ def load_data():
     FROM detalle_venta dv
     JOIN stock_productos_envasados s ON dv.stock_id = s.id
     JOIN ventas v ON dv.venta_id = v.id
-    WHERE s.cliente_id = 6 AND LOWER(v.estado_venta) = 'activa'
-      AND v.fecha_venta >= ?
+    {where_ventas_str}
     """
     try:
-        df_ventas = pd.read_sql_query(query_ventas, conn, params=(FECHA_INICIO_ANALISIS,))
+        df_ventas = pd.read_sql_query(query_ventas, conn, params=tuple(params_ventas))
 
         if not df_ventas.empty:
             df_ventas["fecha_dt"] = pd.to_datetime(df_ventas["fecha"], errors="coerce")
@@ -191,12 +223,13 @@ def load_stock_materias_primas():
     return df
 
 @st.cache_data(ttl=300)
-def load_materias_primas_consumo(fecha_inicio=None, fecha_fin=None):
+def load_materias_primas_consumo(fecha_inicio=None, fecha_fin=None, cliente_id=None):
     """
     Calcula el consumo real exacto de materias primas considerando:
     1. Proporción del ingrediente en la receta (ri.cantidad / total_lote)
     2. Capacidad real del envase comercializado (env.capacidad_litros)
     3. Cantidad de unidades vendidas en estado 'activa'
+    4. Filtro opcional por cliente.
     
     Nota: Se excluye el 'Agua' del cálculo de insumos consumidos.
     """
@@ -214,10 +247,12 @@ def load_materias_primas_consumo(fecha_inicio=None, fecha_fin=None):
     if fecha_fin:
         where_conditions.append("v.fecha_venta <= ?")
         params.append(str(fecha_fin))
+    if cliente_id is not None:
+        where_conditions.append("s.cliente_id = ?")
+        params.append(cliente_id)
 
     where_clause = " AND ".join(where_conditions)
 
-    # Nota: Usamos (ri.cantidad * 1.0) para forzar división de punto flotante en SQLite
     query = f"""
     SELECT 
         mp.id AS materia_prima_id,
@@ -464,6 +499,18 @@ def main():
     st.caption("Sistema integral de control de stock envasado y consumo real de materias primas por ventas")
     st.markdown("---")
 
+    # --- FILTRO GLOBAL DE CLIENTES EN SIDEBAR ---
+    st.sidebar.header("👤 Filtro de Cliente")
+    df_clientes = load_clientes()
+    cliente_opciones = {"Todos los clientes": None}
+    if not df_clientes.empty:
+        for _, row in df_clientes.iterrows():
+            cliente_opciones[f"{row['nombre']} (ID: {row['id']})"] = row['id']
+    
+    cliente_seleccionado_str = st.sidebar.selectbox("Seleccionar Cliente", list(cliente_opciones.keys()))
+    cliente_id_elegido = cliente_opciones[cliente_seleccionado_str]
+    st.sidebar.markdown("---")
+
     # Organización principal mediante pestañas
     tab_stock, tab_materias_primas = st.tabs([
         "📦 Stock & Cobertura de Producción", 
@@ -471,9 +518,9 @@ def main():
     ])
 
     with tab_stock:
-        df_raw = load_data()
+        df_raw = load_data(cliente_id=cliente_id_elegido)
         if df_raw.empty:
-            st.warning("No se encontraron registros activos en la base de datos.")
+            st.warning("No se encontraron registros activos en la base de datos para los criterios seleccionados.")
         else:
             # Info del historial en el Sidebar
             total_ventas_calc = df_raw["Venta_Mensual"].sum()
@@ -555,7 +602,8 @@ def main():
             st.write("")
             aplicar_filtro = st.button("🔍 Filtrar Consumo", type="primary", use_container_width=True)
 
-        df_mp_raw = load_materias_primas_consumo(fecha_desde, fecha_hasta)
+        # Aquí también pasamos el cliente seleccionado para que la materia prima refleje el consumo del cliente elegido o de todos
+        df_mp_raw = load_materias_primas_consumo(fecha_desde, fecha_hasta, cliente_id=cliente_id_elegido)
         df_stock_mp = load_stock_materias_primas()
 
         if df_mp_raw.empty and df_stock_mp.empty:
@@ -624,7 +672,6 @@ def main():
             col_chart1, col_chart2 = st.columns([3, 2])
 
             with col_chart1:
-                # Preparar dataframe largo para el gráfico de barras agrupadas
                 df_chart_comp = df_insumos.melt(
                     id_vars=["materia_prima"],
                     value_vars=["stock_actual", "consumo_total_litros"],

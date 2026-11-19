@@ -57,7 +57,6 @@ def load_data(cliente_id=None):
     """Carga y procesa el stock físico y el historial de ventas por producto, filtrando opcionalmente por cliente."""
     conn = get_db_connection()
 
-    # 1. Cargar Stock Físico Base
     where_stock_clauses = ["p.activo = 1"]
     params_stock = []
     if cliente_id is not None:
@@ -109,8 +108,8 @@ def load_data(cliente_id=None):
     ]
     params_ventas = [FECHA_INICIO_ANALISIS]
     if cliente_id is not None:
-        where_ventas_clauses.append("s.cliente_id = ?")
-        params_ventas.append(cliente_id)
+        where_ventas_clauses.append("(v.cliente_id = ? OR s.cliente_id = ?)")
+        params_ventas.extend([cliente_id, cliente_id])
 
     where_ventas_str = " WHERE " + " AND ".join(where_ventas_clauses)
 
@@ -166,11 +165,7 @@ def load_data(cliente_id=None):
 
 @st.cache_data(ttl=300)
 def load_stock_materias_primas():
-    """
-    Carga el stock disponible actual de las materias primas desde la base de datos SQLite.
-    Prioriza el campo 'cantidad_actual' para determinar el valor del stock.
-    Excluye 'Agua'.
-    """
+    """Carga el stock disponible actual de las materias primas (excluye 'Agua')."""
     conn = get_db_connection()
     try:
         query = """
@@ -198,24 +193,12 @@ def load_stock_materias_primas():
             """
             df = pd.read_sql_query(query_alt, conn)
         except Exception:
-            try:
-                query_fallback = """
-                SELECT 
-                    id AS materia_prima_id,
-                    nombre AS materia_prima,
-                    COALESCE(stock, 0.0) AS stock_actual,
-                    COALESCE(unidad_medida, 'L') AS unidad
-                FROM materias_primas
-                WHERE LOWER(nombre) NOT LIKE '%agua%'
-                """
-                df = pd.read_sql_query(query_fallback, conn)
-            except Exception:
-                query_base = """
-                SELECT id AS materia_prima_id, nombre AS materia_prima, 0.0 AS stock_actual, 'L' AS unidad
-                FROM materias_primas
-                WHERE LOWER(nombre) NOT LIKE '%agua%'
-                """
-                df = pd.read_sql_query(query_base, conn)
+            query_base = """
+            SELECT id AS materia_prima_id, nombre AS materia_prima, 0.0 AS stock_actual, 'L' AS unidad
+            FROM materias_primas
+            WHERE LOWER(nombre) NOT LIKE '%agua%'
+            """
+            df = pd.read_sql_query(query_base, conn)
     finally:
         conn.close()
 
@@ -224,70 +207,93 @@ def load_stock_materias_primas():
 
 @st.cache_data(ttl=300)
 def load_materias_primas_consumo(fecha_inicio=None, fecha_fin=None, cliente_id=None):
-    """
-    Calcula el consumo real exacto de materias primas considerando:
-    1. Proporción del ingrediente en la receta (ri.cantidad / total_lote)
-    2. Capacidad real del envase comercializado (env.capacidad_litros)
-    3. Cantidad de unidades vendidas en estado 'activa'
-    4. Filtro opcional por cliente.
-    
-    Nota: Se excluye el 'Agua' del cálculo de insumos consumidos.
-    """
+    """Calcula el consumo de materias primas basándose en las ventas o, si no hay ventas (ej. producción por cliente sin envase), en el stock/producción del cliente."""
     conn = get_db_connection()
-    
-    where_conditions = [
-        "LOWER(v.estado_venta) = 'activa'",
-        "LOWER(mp.nombre) NOT LIKE '%agua%'"
-    ]
-    params = []
+    df = pd.DataFrame()
 
-    if fecha_inicio:
-        where_conditions.append("v.fecha_venta >= ?")
-        params.append(str(fecha_inicio))
-    if fecha_fin:
-        where_conditions.append("v.fecha_venta <= ?")
-        params.append(str(fecha_fin))
+    # 1. Si se seleccionó un cliente, intentamos primero calcular el consumo basado en su stock/producción registrada
     if cliente_id is not None:
-        where_conditions.append("s.cliente_id = ?")
-        params.append(cliente_id)
+        query_stock_cli = f"""
+        SELECT 
+            mp.id AS materia_prima_id,
+            mp.nombre AS materia_prima,
+            (rec.nombre || ' - ' || env.descripcion) AS producto,
+            SUM(s.cantidad) AS unidades_vendidas,
+            env.capacidad_litros AS capacidad_envase_litros,
+            ROUND((ri.cantidad * 1.0 / rt.total_receta) * 100, 2) AS porcentaje_en_receta,
+            SUM(s.cantidad * env.capacidad_litros * (ri.cantidad * 1.0 / rt.total_receta)) AS consumo_materia_prima_litros
+        FROM stock_productos_envasados s
+        INNER JOIN recetas rec ON rec.id = s.receta_id
+        INNER JOIN envases env ON env.id = s.envase_id
+        INNER JOIN receta_ingredientes ri ON rec.id = ri.receta_id
+        INNER JOIN (
+            SELECT receta_id, SUM(cantidad) AS total_receta
+            FROM receta_ingredientes
+            GROUP BY receta_id
+        ) rt ON rt.receta_id = rec.id
+        INNER JOIN materias_primas mp ON mp.id = ri.materia_prima_id
+        WHERE s.cliente_id = ? AND LOWER(mp.nombre) NOT LIKE '%agua%'
+        GROUP BY mp.id, mp.nombre, s.receta_id, s.envase_id, rec.nombre, env.descripcion, env.capacidad_litros, ri.cantidad, rt.total_receta
+        ORDER BY consumo_materia_prima_litros DESC
+        """
+        try:
+            df = pd.read_sql_query(query_stock_cli, conn, params=[cliente_id])
+        except Exception:
+            df = pd.DataFrame()
 
-    where_clause = " AND ".join(where_conditions)
+    # 2. Si no hay cliente seleccionado o la consulta por stock del cliente no devolvió registros, usamos la lógica de ventas
+    if df.empty:
+        where_conditions = [
+            "LOWER(v.estado_venta) = 'activa'",
+            "LOWER(mp.nombre) NOT LIKE '%agua%'"
+        ]
+        params = []
 
-    query = f"""
-    SELECT 
-        mp.id AS materia_prima_id,
-        mp.nombre AS materia_prima,
-        (rec.nombre || ' - ' || env.descripcion) AS producto,
-        SUM(d.cantidad) AS unidades_vendidas,
-        env.capacidad_litros AS capacidad_envase_litros,
-        ROUND((ri.cantidad * 1.0 / rt.total_receta) * 100, 2) AS porcentaje_en_receta,
-        SUM(d.cantidad * env.capacidad_litros * (ri.cantidad * 1.0 / rt.total_receta)) AS consumo_materia_prima_litros
-    FROM ventas v
-    INNER JOIN detalle_venta d ON v.id = d.venta_id
-    INNER JOIN stock_productos_envasados s ON s.id = d.stock_id
-    INNER JOIN recetas rec ON rec.id = s.receta_id
-    INNER JOIN envases env ON env.id = s.envase_id
-    INNER JOIN receta_ingredientes ri ON rec.id = ri.receta_id
-    INNER JOIN (
-        SELECT receta_id, SUM(cantidad) AS total_receta
-        FROM receta_ingredientes
-        GROUP BY receta_id
-    ) rt ON rt.receta_id = rec.id
-    INNER JOIN materias_primas mp ON mp.id = ri.materia_prima_id
-    WHERE {where_clause}
-    GROUP BY mp.id, mp.nombre, s.receta_id, s.envase_id, rec.nombre, env.descripcion, env.capacidad_litros, ri.cantidad, rt.total_receta
-    ORDER BY consumo_materia_prima_litros DESC
-    """
-    try:
-        df = pd.read_sql_query(query, conn, params=params)
-        df["unidades_vendidas"] = pd.to_numeric(df["unidades_vendidas"], errors="coerce").fillna(0)
-        df["consumo_materia_prima_litros"] = pd.to_numeric(df["consumo_materia_prima_litros"], errors="coerce").fillna(0.0)
-    except Exception as e:
-        st.error(f"Error al cargar consumo de materias primas: {e}")
-        df = pd.DataFrame()
-    finally:
-        conn.close()
+        if fecha_inicio:
+            where_conditions.append("v.fecha_venta >= ?")
+            params.append(str(fecha_inicio))
+        if fecha_fin:
+            where_conditions.append("v.fecha_venta <= ?")
+            params.append(str(fecha_fin))
+        if cliente_id is not None:
+            where_conditions.append("(v.cliente_id = ? OR s.cliente_id = ?)")
+            params.extend([cliente_id, cliente_id])
 
+        where_clause = " AND ".join(where_conditions)
+
+        query = f"""
+        SELECT 
+            mp.id AS materia_prima_id,
+            mp.nombre AS materia_prima,
+            (rec.nombre || ' - ' || env.descripcion) AS producto,
+            SUM(d.cantidad) AS unidades_vendidas,
+            env.capacidad_litros AS capacidad_envase_litros,
+            ROUND((ri.cantidad * 1.0 / rt.total_receta) * 100, 2) AS porcentaje_en_receta,
+            SUM(d.cantidad * env.capacidad_litros * (ri.cantidad * 1.0 / rt.total_receta)) AS consumo_materia_prima_litros
+        FROM ventas v
+        INNER JOIN detalle_venta d ON v.id = d.venta_id
+        INNER JOIN stock_productos_envasados s ON s.id = d.stock_id
+        INNER JOIN recetas rec ON rec.id = s.receta_id
+        INNER JOIN envases env ON env.id = s.envase_id
+        INNER JOIN receta_ingredientes ri ON rec.id = ri.receta_id
+        INNER JOIN (
+            SELECT receta_id, SUM(cantidad) AS total_receta
+            FROM receta_ingredientes
+            GROUP BY receta_id
+        ) rt ON rt.receta_id = rec.id
+        INNER JOIN materias_primas mp ON mp.id = ri.materia_prima_id
+        WHERE {where_clause}
+        GROUP BY mp.id, mp.nombre, s.receta_id, s.envase_id, rec.nombre, env.descripcion, env.capacidad_litros, ri.cantidad, rt.total_receta
+        ORDER BY consumo_materia_prima_litros DESC
+        """
+        try:
+            df = pd.read_sql_query(query, conn, params=params)
+        except Exception:
+            df = pd.DataFrame()
+
+    conn.close()
+    df["unidades_vendidas"] = pd.to_numeric(df["unidades_vendidas"], errors="coerce").fillna(0)
+    df["consumo_materia_prima_litros"] = pd.to_numeric(df["consumo_materia_prima_litros"], errors="coerce").fillna(0.0)
     return df
 
 def clasificar_stock(df, meses_critico, meses_objetivo, meses_excedente, stock_min_defecto):
@@ -522,7 +528,6 @@ def main():
         if df_raw.empty:
             st.warning("No se encontraron registros activos en la base de datos para los criterios seleccionados.")
         else:
-            # Info del historial en el Sidebar
             total_ventas_calc = df_raw["Venta_Mensual"].sum()
             info_h = st.session_state.get("historial_info", None)
             if total_ventas_calc > 0 and info_h:
@@ -602,14 +607,12 @@ def main():
             st.write("")
             aplicar_filtro = st.button("🔍 Filtrar Consumo", type="primary", use_container_width=True)
 
-        # Aquí también pasamos el cliente seleccionado para que la materia prima refleje el consumo del cliente elegido o de todos
         df_mp_raw = load_materias_primas_consumo(fecha_desde, fecha_hasta, cliente_id=cliente_id_elegido)
         df_stock_mp = load_stock_materias_primas()
 
         if df_mp_raw.empty and df_stock_mp.empty:
             st.warning("⚠️ No se registraron datos de ventas ni materias primas en la base de datos.")
         else:
-            # Agrupar consumo global por Materia Prima
             if not df_mp_raw.empty:
                 df_mp_ranking = df_mp_raw.groupby("materia_prima", as_index=False).agg(
                     consumo_total_litros=("consumo_materia_prima_litros", "sum"),
@@ -619,7 +622,6 @@ def main():
             else:
                 df_mp_ranking = pd.DataFrame(columns=["materia_prima", "consumo_total_litros", "total_unidades_vendidas", "variedad_productos"])
 
-            # Unir con el Stock Actual Disponible
             df_insumos = pd.merge(
                 df_stock_mp,
                 df_mp_ranking,
@@ -632,7 +634,6 @@ def main():
             df_insumos["total_unidades_vendidas"] = df_insumos["total_unidades_vendidas"].fillna(0)
             df_insumos["variedad_productos"] = df_insumos["variedad_productos"].fillna(0)
             
-            # Balance y Diagnóstico de Cobertura
             df_insumos["balance_remante"] = df_insumos["stock_actual"] - df_insumos["consumo_total_litros"]
             
             def evaluar_estado_insumo(row):
@@ -757,7 +758,6 @@ def main():
                 )
                 st.plotly_chart(fig_tree_mp, use_container_width=True)
 
-            # Descargar reporte CSV
             csv_mp = df_control.to_csv(index=False).encode("utf-8")
             st.download_button(
                 "⬇️ Descargar Reporte de Stock y Consumo de Insumos (CSV)",
